@@ -22,6 +22,7 @@
 
 #ifdef USE_FSCRYPT
 #include "fscrypt_policy.h"
+#include "fscrypt_compat.h"
 #endif
 
 #ifdef __cplusplus

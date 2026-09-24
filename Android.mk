@@ -140,6 +140,7 @@ LOCAL_C_INCLUDES += \
 
 LOCAL_STATIC_LIBRARIES += libguitwrp libvold
 LOCAL_SHARED_LIBRARIES += libz libc libcutils libstdc++ libtar libblkid libminuitwrp libmtdutils libtwadbbu
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/bootloader_message/include
 LOCAL_SHARED_LIBRARIES += libbootloader_message libcrecovery libtwrpdigest libc++ libaosprecovery libcrypto libbase 
 LOCAL_SHARED_LIBRARIES += libziparchive libselinux libdl_android.bootstrap
 
@@ -343,6 +344,7 @@ ifeq ($(TW_INCLUDE_CRYPTO), true)
         android.security.maintenance-ndk \
         android.system.keystore2-V4-ndk \
         libkeyutils \
+        libsysutils \
         liblog \
         libsqlite.recovery \
         libkeystoreinfo.recovery \

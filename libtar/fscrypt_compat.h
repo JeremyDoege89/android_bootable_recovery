@@ -35,6 +35,17 @@
 
 __BEGIN_DECLS
 
+/* linux/fscrypt.h carries a legacy compatibility macro:
+ *     #define fscrypt_policy fscrypt_policy_v1
+ * Because it is a macro, not a typedef, it textually rewrites the name in the
+ * typedef below and breaks any build that pulls that header in (the recovery
+ * binary does, via vold). Drop it so fscrypt_policy can mean whichever policy
+ * version this build selected.
+ */
+#ifdef fscrypt_policy
+#undef fscrypt_policy
+#endif
+
 #ifdef USE_FSCRYPT_POLICY_V1
 typedef struct fscrypt_policy_v1 fscrypt_policy;
 #define FSCRYPT_COMPAT_KEY_SIZE      FS_KEY_DESCRIPTOR_SIZE

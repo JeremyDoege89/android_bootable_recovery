@@ -45,10 +45,12 @@ extern "C" {
 #include "gui/pages.hpp"
 #include "gui/objects.hpp"
 #include "twcommon.h"
+#include <android/log.h>
 #include "twrp-functions.hpp"
 #include "data.hpp"
 
 #include "partitions.hpp"
+#include <bootloader_message/bootloader_message.h>
 #ifdef __ANDROID_API_N__
 #include <android-base/strings.h>
 #else
@@ -355,6 +357,13 @@ int main(int argc, char **argv) {
 	freopen(TMP_LOG_FILE, "a", stderr);
 	setbuf(stderr, NULL);
 
+	// Route liblog to stderr, which the freopen above points at
+	// /tmp/recovery.log. Without this, every LOG()/PLOG() from the vold
+	// code TWRP links against is discarded (there is no logd in recovery),
+	// so a failed fscrypt_mount_metadata_encrypted() surfaces only as the
+	// generic "Unable to decrypt metadata encryption" with no reason.
+	__android_log_set_logger(__android_log_stderr_logger);
+
 	signal(SIGPIPE, SIG_IGN);
 
 	// Handle ADB sideload
@@ -398,6 +407,36 @@ int main(int argc, char **argv) {
 	if (!PartitionManager.Process_Fstab(fstab_filename, 1, !startup.Get_Fastboot_Mode())) {
 		LOGERR("Failing out of recovery due to problem with fstab.\n");
 		return -1;
+	}
+
+	// Clear the bootloader control block so the next boot goes to the system
+	// instead of straight back into recovery. Nothing else in TWRP does this:
+	// TWRP builds twrp.cpp rather than AOSP recovery.cpp, so FinishRecovery(),
+	// the function that erases the BCB, is not compiled in at all. Both
+	// "fastboot reboot recovery" and Android "reboot recovery" write
+	// "boot-recovery" into misc, and with nothing clearing it every later boot
+	// returns here, cold boots included - the only escape being Start from the
+	// bootloader menu.
+	//
+	// Only the 2048-byte bootloader_message struct at offset 0 is zeroed. The
+	// bootloader_control slot-selection block begins at offset 2048 and is left
+	// untouched; erasing that would break A/B slot selection. TWRP takes no
+	// startup arguments from the BCB, so nothing is lost by clearing it here.
+	{
+		TWPartition* misc_part = PartitionManager.Find_Partition_By_Path("/misc");
+		bootloader_message boot = {};
+		std::string bcb_err;
+		bool bcb_cleared;
+		if (misc_part != NULL && !misc_part->Actual_Block_Device.empty()) {
+			bcb_cleared = write_bootloader_message_to(boot, misc_part->Actual_Block_Device, &bcb_err);
+		} else {
+			// No /misc in the TWRP fstab - fall back to the fs_mgr lookup.
+			bcb_cleared = clear_bootloader_message(&bcb_err);
+		}
+		if (bcb_cleared)
+			printf("=> Cleared bootloader control block\n");
+		else
+			printf("=> Failed to clear bootloader control block: %s\n", bcb_err.c_str());
 	}
 
 #ifdef TW_LOAD_VENDOR_MODULES

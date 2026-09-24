@@ -422,6 +422,16 @@ clear:
 		if (TWFunc::Find_Fstab(Fstab_Filename)) {
 			LOGINFO("Fstab: %s\n", Fstab_Filename.c_str());
 			TWFunc::copy_file(Fstab_Filename, additional_fstab, 0600, false);
+			// libfs_mgr's ReadDefaultFstab() hardcodes /etc/recovery.fstab whenever
+			// /system/bin/recovery exists, and it demands the 5-field AOSP format.
+			// TWRP's own recovery.fstab is 4-field, so every fs_mgr consumer in
+			// recovery - vold's metadata decrypt and the boot control HAL, which
+			// needs it to locate the misc partition - fails with
+			// "expected 5 fields, got 4" and the boot HAL aborts on Check failed:
+			// impl_.Init(). Publish the real device fstab there as well; TWRP has
+			// already parsed its own copy into memory by this point, and its
+			// parser handles this format too (it is about to parse it below).
+			TWFunc::copy_file(Fstab_Filename, "/etc/recovery.fstab", 0644, false);
 			Fstab_Filename = additional_fstab;
 			property_set("fstab.additional", "1");
 			goto parse;
@@ -582,6 +592,32 @@ int TWPartitionManager::Write_Fstab(void) {
 	return true;
 }
 
+// Bring up the Trustonic TEE stack before attempting metadata decryption.
+// It cannot be autostarted from init: mcDriverDaemon reads its trustlet registry
+// from the vendor partition, which is logical and only gets mapped once TWRP has
+// set up partitions. Starting it here - after partition setup, before the first
+// decrypt attempt - means the very first attempt has a working KeyMint, so no
+// half-built "userdata" dm-default-key device is left behind to block a retry.
+static void TWRP_Start_TEE_For_Decrypt() {
+	if (android::base::GetProperty("init.svc.vendor.keymint-trustonic", "") == "running")
+		return;
+	LOGINFO("Starting TEE stack for decryption...\n");
+	android::base::SetProperty("twrp.tee.start", "1");
+	for (int i = 0; i < 60; i++) {  // up to ~30s
+		if (android::base::GetProperty("init.svc.vendor.keymint-trustonic", "") == "running") {
+			LOGINFO("TEE ready: mobicore=%s keymint=%s keystore2=%s\n",
+				android::base::GetProperty("init.svc.mobicore", "?").c_str(),
+				android::base::GetProperty("init.svc.vendor.keymint-trustonic", "?").c_str(),
+				android::base::GetProperty("init.svc.keystore2", "?").c_str());
+			usleep(500000);  // let keystore2 settle
+			return;
+		}
+		usleep(500000);
+	}
+	LOGERR("TEE did not come up; decryption will likely fail (trustonic.ready=%s)\n",
+		android::base::GetProperty("ro.vendor.trustonic.ready", "?").c_str());
+}
+
 void TWPartitionManager::Decrypt_Data() {
 	#ifdef TW_INCLUDE_CRYPTO
 	TWPartition* Decrypt_Data = Find_Partition_By_Path("/data");
@@ -593,9 +629,10 @@ void TWPartitionManager::Decrypt_Data() {
 				Mount_By_Path(Decrypt_Data->Key_Directory, false);
 		if (!Decrypt_Data->Key_Directory.empty()) {
 			Set_Crypto_Type("file");
+			TWRP_Start_TEE_For_Decrypt();
 #ifdef TW_INCLUDE_FBE_METADATA_DECRYPT
 #ifdef USE_FSCRYPT
-			if (android::vold::fscrypt_mount_metadata_encrypted(Decrypt_Data->Actual_Block_Device, Decrypt_Data->Mount_Point, false, false, Decrypt_Data->Current_File_System, TWFunc::Path_Exists(additional_fstab) ? additional_fstab : "")) {
+			if (android::vold::fscrypt_mount_metadata_encrypted(Decrypt_Data->Actual_Block_Device, Decrypt_Data->Mount_Point, false, false, Decrypt_Data->Current_File_System, "", TWFunc::Path_Exists(additional_fstab) ? additional_fstab : "")) {
 				std::string crypto_blkdev = android::base::GetProperty("ro.crypto.fs_crypto_blkdev", "error");
 				Decrypt_Data->Decrypted_Block_Device = crypto_blkdev;
 				LOGINFO("Successfully decrypted metadata encrypted data partition with new block device: '%s'\n", crypto_blkdev.c_str());
@@ -629,22 +666,11 @@ void TWPartitionManager::Decrypt_Data() {
 				}
 			}
 		} else {
-			LOGINFO("FBE setup failed. Trying FDE...\n");
-			Set_Crypto_State();
-			Set_Crypto_Type("block");
-			int password_type = cryptfs_get_password_type();
-			if (password_type == CRYPT_TYPE_DEFAULT) {
-				LOGINFO("Device is encrypted with the default password, attempting to decrypt.\n");
-				if (Decrypt_Device("default_password") == 0) {
-					gui_msg("decrypt_success=Successfully decrypted with default password.");
-					DataManager::SetValue(TW_IS_ENCRYPTED, 0);
-				} else {
-					gui_err("unable_to_decrypt=Unable to decrypt with default password.");
-				}
-			} else {
-				DataManager::SetValue("TW_CRYPTO_TYPE", password_type);
-				DataManager::SetValue("tw_crypto_pwtype_0", password_type);
-			}
+			// Legacy FDE fallback removed; FDE was deprecated as of Android 10
+			// (see AOSP system/vold commit 0803ba0). This device is FBE-only,
+			// so a failed FBE setup has no legacy fallback path.
+			LOGERR("FBE setup failed and no legacy FDE support is available on this device.\n");
+			gui_err("unable_to_decrypt=Unable to decrypt with default password.");
 		}
 	}
 	if (Decrypt_Data && (!Decrypt_Data->Is_Encrypted || Decrypt_Data->Is_Decrypted)) {
@@ -2168,32 +2194,11 @@ int TWPartitionManager::Decrypt_Device(string Password, int user_id) {
 		return -1;
 	}
 
-	char isdecrypteddata[PROPERTY_VALUE_MAX];
-	property_get("twrp.decrypt.done", isdecrypteddata, "");
-	if (strcmp(isdecrypteddata, "true") == 0) {
-		LOGINFO("Data has no decryption required\n");
-		return 0;
-	}
-
-	int pwret = -1;
-	pid_t pid = fork();
-	if (pid < 0) {
-		LOGERR("fork failed\n");
-		return -1;
-	} else if (pid == 0) {
-		// Child process
-		char cPassword[255];
-		strcpy(cPassword, Password.c_str());
-		int ret = cryptfs_check_passwd(cPassword);
-		exit(ret);
-	} else {
-		// Parent
-		int status;
-		if (TWFunc::Wait_For_Child_Timeout(pid, &status, "Decrypt", 30))
-			pwret = -1;
-		else
-			pwret = WEXITSTATUS(status) ? -1 : 0;
-	}
+	// Legacy FDE password verification removed; FDE was deprecated as of
+	// Android 10 (see AOSP system/vold commit 0803ba0). This device is
+	// FBE-only, so this codepath is unreachable (TW_IS_FBE returns above),
+	// but is kept compiling as a safe fallback.
+	LOGERR("No legacy FDE decryption path is available on this device.\n");
 
 	// Unmount any partitions that were needed for decrypt
 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
@@ -2203,18 +2208,8 @@ int TWPartitionManager::Decrypt_Device(string Password, int user_id) {
 	}
 	property_set("twrp.mount_to_decrypt", "0");
 
-	if (pwret != 0) {
-		gui_err("fail_decrypt=Failed to decrypt data.");
-		return -1;
-	}
-
-	property_get("ro.crypto.fs_crypto_blkdev", crypto_blkdev, "error");
-	if (strcmp(crypto_blkdev, "error") == 0) {
-		LOGERR("Error retrieving decrypted data block device.\n");
-	} else {
-		Post_Decrypt(crypto_blkdev);
-	}
-	return 0;
+	gui_err("fail_decrypt=Failed to decrypt data.");
+	return -1;
 #else
 	gui_err("no_crypto_support=No crypto support was compiled into this build.");
 	return -1;

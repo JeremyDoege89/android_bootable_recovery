@@ -343,6 +343,7 @@ ifeq ($(TW_INCLUDE_CRYPTO), true)
         android.frameworks.stats@1.0 \
         android.security.maintenance-ndk \
         android.system.keystore2-V4-ndk \
+        android.hardware.gatekeeper-V1-ndk \
         libkeyutils \
         libsysutils \
         liblog \
